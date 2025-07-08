@@ -2,12 +2,114 @@
 import time
 import torch
 import torch.nn as nn
-
-# Import get_loaders function from data module within the same directory
 from .data import get_loaders 
-
 from collections import defaultdict
 import fnmatch
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
+from model_configs import get_model_cfg
+import math, re, torch
+from datasets import load_dataset
+
+def _try_batch(model, ids, bs, first_dev, need_attn_mask=False):
+    """Return True if forward pass fits in memory for given batch size."""
+    bs = min(bs, ids.size(0))
+    inp = ids[:bs].to(first_dev)
+    tgt = inp.clone(); tgt[:, 0] = -100
+    amask = torch.ones_like(inp).to(first_dev) if need_attn_mask else None
+    try:
+        with torch.no_grad():
+            _ = model(inp, attention_mask=amask, labels=tgt, use_cache=False)
+        return True
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            torch.cuda.empty_cache()
+            return False
+        raise
+
+
+def compute_wikitext_ppl(model,
+                         tokenizer,
+                         device,
+                         batch_size: str | int = "auto"):
+    """
+    Perplexity on WikiText-2-raw-v1 test split using fixed-length blocks.
+    • context length = cfg["max_len"] (falls back to 2048)
+    • `use_cache=False` to minimise VRAM
+    • optional automatic batch-size tuning
+    Returns: ppl (float)
+    """
+    model.eval()
+    cfg = get_model_cfg(model.config._name_or_path.split("/")[-1])
+    block_size = cfg.get("max_len", 2048)
+
+    # pick "first" device for forward calls
+    if getattr(model, "hf_device_map", None):
+        first_dev = next(iter(model.hf_device_map.values()))
+    else:
+        first_dev = device
+
+    # need_attn_mask flag for Llama-4 Scout variants
+    need_attn_mask = bool(re.match(r"^Llama-4-Scout", model.config._name_or_path))
+
+    # ------------------- dataset ------------------- #
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    text = "\n\n".join(ds["text"])
+    tokens = tokenizer(text,
+                       add_special_tokens=False,
+                       return_tensors="pt").input_ids[0]
+
+    if tokenizer.bos_token_id is not None:
+        tokens = torch.cat([torch.tensor([tokenizer.bos_token_id]), tokens])
+
+    nsamples = tokens.numel() // block_size
+    if nsamples == 0:
+        raise ValueError(f"Not enough tokens for block_size={block_size}")
+
+    ids = tokens[: nsamples * block_size].view(nsamples, block_size)
+
+    # --------------- batch-size autotune ------------ #
+    if batch_size == "auto":
+        MAX_BS = 16
+        best, bs = 1, 1
+        while bs <= MAX_BS:
+            if _try_batch(model, ids, bs, first_dev, need_attn_mask):
+                best, bs = bs, bs * 2
+            else:
+                bs //= 2; break
+        batch_size = best
+    else:
+        batch_size = int(batch_size)
+
+    # ------------------- main loop ------------------ #
+    nll, tok_cnt = 0.0, 0
+    i, bs_cur = 0, batch_size
+    while i < nsamples:
+        j = min(i + bs_cur, nsamples)
+        inp = ids[i:j].to(first_dev)
+        tgt = inp.clone(); tgt[:, 0] = -100
+        amask = torch.ones_like(inp).to(first_dev) if need_attn_mask else None
+
+        try:
+            with torch.no_grad():
+                loss = model(inp,
+                             attention_mask=amask,
+                             labels=tgt,
+                             use_cache=False).loss.item()
+            toks = tgt.ne(-100).sum().item()
+            nll  += loss * toks
+            tok_cnt += toks
+            i += bs_cur
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() and bs_cur > 1:
+                torch.cuda.empty_cache()
+                bs_cur //= 2
+                print(f"⚠️  OOM – reduce batch_size to {bs_cur}, retry")
+            else:
+                raise
+
+    return math.exp(nll / tok_cnt)
+
 
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
@@ -84,6 +186,8 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
     # Get input IDs
     testenc = testenc.input_ids
 
+    
+    
     # Calculate number of samples
     nsamples = testenc.numel() // model.seqlen
 

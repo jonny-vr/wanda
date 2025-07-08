@@ -1,12 +1,17 @@
 import argparse
 import os 
+import re
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, Gemma3TextModel, Llama4ForConditionalGeneration, Gemma3ForConditionalGeneration
 from importlib.metadata import version
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+from model_configs import get_model_cfg
 
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
-from lib.eval import eval_ppl, eval_zero_shot
+from lib.eval import eval_ppl, eval_zero_shot, compute_wikitext_ppl
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -14,15 +19,30 @@ print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
 def get_llm(model_name, cache_dir="llm_weights"):
-    model = AutoModelForCausalLM.from_pretrained(
+    
+    is_llama4 = bool(re.match(r"^Llama-4-Scout", model_name))
+    is_gemma  = bool(re.match(r"^Gemma-3-", model_name, flags=re.IGNORECASE))
+    if is_llama4:
+        model_cls = Llama4ForConditionalGeneration
+    elif is_gemma:
+        model_cls = Gemma3ForConditionalGeneration
+    else:
+        model_cls = AutoModelForCausalLM
+        
+    cfg = get_model_cfg(model_name)
+
+    model = model_cls.from_pretrained(
         model_name, 
-        torch_dtype=torch.float16, 
+        torch_dtype=cfg["torch_dtype"], 
         cache_dir=cache_dir, 
         low_cpu_mem_usage=True, 
         device_map="auto"
     )
+    ## für llama, qwen und gemma models
+    model.seqlen = getattr(getattr(model.config, "text_config", model.config),
+                       "max_position_embeddings",
+                       cfg["max_len"])           # Fallback: cfg["max_len"]
 
-    model.seqlen = model.config.max_position_embeddings 
     return model
 
 def main():
@@ -56,11 +76,11 @@ def main():
     print(f"loading llm model {args.model}")
     model = get_llm(args.model, args.cache_dir)
     model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True, trust_remote_code=True)
 
     device = torch.device("cuda:0")
-    if "30b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
-        device = model.hf_device_map["lm_head"]
+    if any(size in args.model.lower() for size in ["30b", "65b", "70b", "235b"]):
+         device = model.hf_device_map["lm_head"]
     print("use device ", device)
 
     if args.sparsity_ratio != 0:
@@ -80,8 +100,8 @@ def main():
     print(f"sparsity sanity check {sparsity_ratio:.4f}")
     print("*"*30)
     ################################################################
-    ppl_test = eval_ppl(args, model, tokenizer, device)
-    print(f"wikitext perplexity {ppl_test}")
+    ppl_test = compute_wikitext_ppl(model, tokenizer, device, batch_size="auto")
+    print(f"WikiText-2 perplexity {ppl_test:.2f}")
 
     if not os.path.exists(args.save):
         os.makedirs(args.save)
