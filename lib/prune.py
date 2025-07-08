@@ -55,44 +55,72 @@ def check_sparsity(model):
     model.config.use_cache = use_cache 
     return float(count)/total_params 
 
-def prepare_calibration_input(model, dataloader, device):
+def prepare_calibration_input(model, dataloader, device, calib_len=2048):
+    """
+    Collect `nsamples × calib_len` hidden-states from the first decoder block
+    and return them together with the exact kwargs that were fed into the model.
+    Works for Qwen-3 (needs position_embeddings) *and* Llama-family
+    (needs position_ids).
+
+    Returns
+    -------
+    inps :  (nsamples, calib_len, hidden)  tensor
+    outs :  same shape,      initialised to zeros
+    kw   :  dict with attention_mask / position_ids / position_embeddings
+    """
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.model.layers
 
-    # dev = model.hf_device_map["model.embed_tokens"]
+    # if the model was automatically sharded -> use the same GPU as the embeddings
     if "model.embed_tokens" in model.hf_device_map:
         device = model.hf_device_map["model.embed_tokens"]
 
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
-    inps.requires_grad = False
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    dtype   = next(iter(model.parameters())).dtype
+    nsample = len(dataloader)                 # should equal args.nsamples
+    inps    = torch.zeros((nsample, calib_len, model.config.hidden_size),
+                          dtype=dtype, device=device)
+
+    # shared bag where the Catcher stores activations + the first kwargs
+    store = {"inps": inps,
+             "i":   0,
+             "kw":  {}}
 
     class Catcher(nn.Module):
-        def __init__(self, module):
+        def __init__(self, layer, bag):
             super().__init__()
-            self.module = module
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            raise ValueError
-    layers[0] = Catcher(layers[0])
+            self._orig, self._bag = layer, bag
+
+        def forward(self, hidden_states, **kwargs):
+            b = self._bag
+            b["inps"][b["i"]] = hidden_states
+            b["i"] += 1
+            if not b["kw"]:               # save kwargs only once
+                b["kw"] = kwargs
+            raise ValueError              # stop forward pass here
+
+        # delegate every unknown attribute to the wrapped layer
+        def __getattr__(self, name):
+            if name in {"_orig", "_bag"}:
+                return super().__getattr__(name)
+            return getattr(self._orig, name)
+
+    # wrap the first decoder block
+    first = model.model.layers[0]
+    model.model.layers[0] = Catcher(first, store)
+
     for batch in dataloader:
         try:
-            model(batch[0].to(device))
+            model(batch[0].to(device)[:, :calib_len])
         except ValueError:
-            pass 
-    layers[0] = layers[0].module
+            pass                           # Catcher always raises
 
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
+    # unwrap
+    model.model.layers[0] = first
     model.config.use_cache = use_cache
 
-    return inps, outs, attention_mask, position_ids 
+    outs = torch.zeros_like(inps)
+    return inps, outs, store["kw"]
+
 
 def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     thres_cumsum = sum_before * alpha 
@@ -124,89 +152,99 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
 
             W[W_mask] = 0
 
-def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
-    use_cache = model.config.use_cache 
-    model.config.use_cache = False 
+def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"),
+                prune_n=0, prune_m=0):
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
 
-    print("loading calibdation data")
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
-    print("dataset loading complete")
+    calib_len = 2048                         # shorter window for fast calibration
+    print("loading calibration data")
+    dataloader, _ = get_loaders(
+        "wikitext2",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,                   # IMPORTANT: use same length everywhere
+        tokenizer=tokenizer,
+    )
+
     with torch.no_grad():
-        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+        inps, outs, replay_kw = prepare_calibration_input(
+            model, dataloader, device, calib_len
+        )
+    print("dataset loading complete")
+
+    # unpack the captured kwargs once
+    attn_mask = replay_kw.get("attention_mask")
+    pos_ids   = replay_kw.get("position_ids")
+    pos_emb   = replay_kw.get("position_embeddings")   # Qwen-3 only
 
     layers = model.model.layers
-    for i in range(len(layers)):
-        layer = layers[i]
+    for i, layer in enumerate(layers):
         subset = find_layers(layer)
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+        # move tensors to the GPU that holds this layer (for sharded 30B/65B)
+        if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+            inps = inps.to(dev)
+            outs = outs.to(dev)
+            if attn_mask is not None:
+                attn_mask = attn_mask.to(dev)
+            if pos_ids is not None:
+                pos_ids = pos_ids.to(dev)
+            if pos_emb is not None:
+                pos_emb = tuple(p.to(dev) for p in pos_emb)
 
-        wrapped_layers = {}
-        for name in subset:
-            wrapped_layers[name] = WrappedGPT(subset[name])
+        # ------------- gather activation statistics -----------------
+        wrapped_layers = {n: WrappedGPT(m) for n, m in subset.items()}
 
         def add_batch(name):
-            def tmp(_, inp, out):
+            def _hook(_, inp, out):
                 wrapped_layers[name].add_batch(inp[0].data, out.data)
-            return tmp
+            return _hook
 
-        handles = []
-        for name in wrapped_layers:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
+        handles = [m.register_forward_hook(add_batch(n)) for n, m in subset.items()]
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(
+                    inps[j].unsqueeze(0),
+                    attention_mask=attn_mask,
+                    position_ids=pos_ids,
+                    position_embeddings=pos_emb,
+                )[0]
         for h in handles:
             h.remove()
 
-        for name in subset:
+        # ----------------------- pruning ----------------------------
+        for name, mod in subset.items():
             print(f"pruning layer {i} name {name}")
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+            W = mod.weight.data
+            W_metric = torch.abs(W) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
 
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
-            if prune_n != 0:
-                # structured n:m sparsity
-                for ii in range(W_metric.shape[1]):
-                    if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
-            else:
-                sort_res = torch.sort(W_metric, dim=-1, stable=True)
+            W_mask = torch.zeros_like(W, dtype=torch.bool)
+            if prune_n:                    # structured N:M
+                for col in range(0, W_metric.shape[1], prune_m):
+                    block = W_metric[:, col:col + prune_m]
+                    topk  = torch.topk(block, prune_n, dim=1, largest=False).indices
+                    W_mask.scatter_(1, col + topk, True)
+            else:                          # unstructured
+                k = int(W_metric.numel() * args.sparsity_ratio)
+                thresh = torch.topk(W_metric.view(-1), k, largest=False).values.max()
+                W_mask = W_metric <= thresh
 
-                if args.use_variant:
-                    # wanda variant 
-                    tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                    sum_before = W_metric.sum(dim=1)
+            W[W_mask] = 0.0
 
-                    alpha = 0.4
-                    alpha_hist = [0., 0.8]
-                    W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    while (torch.abs(cur_sparsity - args.sparsity_ratio)>0.001) and (alpha_hist[1]-alpha_hist[0]>=0.001):
-                        if cur_sparsity > args.sparsity_ratio:
-                            alpha_new = (alpha + alpha_hist[0]) / 2.0
-                            alpha_hist[1] = alpha
-                        else:
-                            alpha_new = (alpha + alpha_hist[1]) / 2.0
-                            alpha_hist[0] = alpha
-
-                        alpha = alpha_new 
-                        W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
-                else:
-                    # unstructured pruning
-                    indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
-                    W_mask.scatter_(1, indices, True)
-
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
-
+        # swap inps/outs for next layer
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        inps, outs = outs, inps
+                outs[j] = layer(
+                    inps[j].unsqueeze(0),
+                    attention_mask=attn_mask,
+                    position_ids=pos_ids,
+                    position_embeddings=pos_emb,
+                )[0]
+        inps, outs = outs, inps            # flip buffers
 
-    model.config.use_cache = use_cache 
+    model.config.use_cache = use_cache
     torch.cuda.empty_cache()
 
 
@@ -214,7 +252,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+    dataloader, _ = get_loaders("wikitext2",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -229,16 +267,35 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     )
     cache = {'i': 0, 'attention_mask': None, "position_ids": None}
 
+
     class Catcher(nn.Module):
-        def __init__(self, module):
+        """
+        A proxy that (1) grabs the pre-block activations for Wanda / SparseGPT
+        and (2) still looks *exactly* like the original layer to the outside
+        world – all attributes and methods are transparently delegated.
+        """
+        def __init__(self, module, store):
             super().__init__()
-            self.module = module
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            raise ValueError
+            self._orig  = module      # the real decoder layer
+            self._store = store       # dict with inps / masks / counters
+
+        # ------------------------- forward hook -------------------------
+        def forward(self, hidden_states, **kwargs):
+            """Save activations then raise to break the forward pass."""
+            self._store['inps'][self._store['i']] = hidden_states
+            self._store['i'] += 1
+            self._store['attention_mask'] = kwargs.get('attention_mask')
+            self._store['position_ids']   = kwargs.get('position_ids')
+            raise ValueError              # caught by prepare_calibration_input
+
+        # ----------------- transparent attribute delegation -------------
+        def __getattr__(self, name):
+            # keep local internals safe
+            if name in {'_orig', '_store'}:
+                return super().__getattr__(name)
+            # anything else → fall back to the real layer
+            return getattr(self._orig, name)
+        
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
@@ -305,7 +362,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
 def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+    dataloader, _ = get_loaders("wikitext2",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
 
     use_cache = model.config.use_cache
     model.config.use_cache = False

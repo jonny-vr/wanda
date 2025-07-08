@@ -39,28 +39,9 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
 
 # Load and process c4 dataset
 def get_c4(nsamples, seed, seqlen, tokenizer):
-    # traindata = load_dataset('allenai/c4', 'en', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train', trust_remote_code=True)
-    # valdata = load_dataset('allenai/c4', 'en', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation', trust_remote_code=True)
+    traindata = load_dataset('allenai/c4', 'en', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train', trust_remote_code=True)
+    valdata = load_dataset('allenai/c4', 'en', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation', trust_remote_code=True)
     
-    # 1) Pull exactly the two files the builder expects:
-    traindata = load_dataset(
-    "allenai/c4",
-    "en",
-    data_files={"train": ["en/c4-train.00000-of-01024.json.gz"]},
-    split="train",
-    trust_remote_code=True,
-    streaming=True,    # ← key to skip the full‐dataset check
-    )
-
-    valdata = load_dataset(
-        "allenai/c4",
-        "en",
-        data_files={"validation": ["en/c4-validation.00000-of-00008.json.gz"]},
-        split="validation",
-        trust_remote_code=True,
-        streaming=True,
-    )
-
 
     # Generate samples from training set
     random.seed(seed)
