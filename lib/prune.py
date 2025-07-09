@@ -1,4 +1,5 @@
 import time 
+import inspect
 import heapq 
 import torch 
 import torch.nn as nn 
@@ -205,14 +206,16 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"),
         handles = [m.register_forward_hook(add_batch(n)) for n, m in subset.items()]
         for j in range(args.nsamples):
             with torch.no_grad():
-                call_kwargs = {
-                    "attention_mask": attn_mask,
-                    "position_ids":   pos_ids,
-                }
-                # only include pos_emb if the layer actually accepts it
-                if pos_emb is not None and "position_embeddings" in layer.forward.__code__.co_varnames:
+                sig = inspect.signature(layer.forward)
+                call_kwargs = {}
+                if attn_mask is not None:
+                    call_kwargs["attention_mask"] = attn_mask
+                if pos_ids is not None:
+                    call_kwargs["position_ids"] = pos_ids
+                # nur mitsenden, wenn das Layer position_embeddings erwartet
+                if pos_emb is not None and "position_embeddings" in sig.parameters:
                     call_kwargs["position_embeddings"] = pos_emb
-
+                    
                 outs[j] = layer(inps[j].unsqueeze(0), **call_kwargs)[0]
         for h in handles:
             h.remove()
@@ -239,14 +242,16 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"),
         # swap inps/outs for next layer
         for j in range(args.nsamples):
             with torch.no_grad():
-                call_kwargs = {
-                    "attention_mask": attn_mask,
-                    "position_ids":   pos_ids,
-                }
-                # only include pos_emb if the layer actually accepts it
-                if pos_emb is not None and "position_embeddings" in layer.forward.__code__.co_varnames:
+                sig = inspect.signature(layer.forward)
+                call_kwargs = {}
+                if attn_mask is not None:
+                    call_kwargs["attention_mask"] = attn_mask
+                if pos_ids is not None:
+                    call_kwargs["position_ids"] = pos_ids
+                # nur mitsenden, wenn das Layer position_embeddings erwartet
+                if pos_emb is not None and "position_embeddings" in sig.parameters:
                     call_kwargs["position_embeddings"] = pos_emb
-
+                    
                 outs[j] = layer(inps[j].unsqueeze(0), **call_kwargs)[0]
         inps, outs = outs, inps            # flip buffers
 
@@ -255,112 +260,136 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"),
 
 
 @torch.no_grad()
-def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
-    ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
-    print('Starting ...')
-    dataloader, _ = get_loaders("wikitext2",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+@torch.no_grad()
+def prune_sparsegpt(
+    args,
+    model,
+    tokenizer,
+    dev=torch.device("cuda:0"),
+    prune_n: int = 0,
+    prune_m: int = 0,
+):
+    """
+    SparseGPT-Pruning mit Qwen/DeepSeek-Kompatibilität:
+    * nutzt prepare_calibration_input → verarbeitet attention_mask, position_ids,
+      UND position_embeddings (falls vorhanden)
+    * reicht position_embeddings nur weiter, wenn das jeweilige Layer sie erwartet
+    * funktioniert weiterhin mit (optionaler) Geräte-Shard-Verteilung
+    """
+    print("Starting SparseGPT pruning …")
+
+    # ----------------------------------------------------------
+    # 1) Kalibrierdaten laden und Aktivierungen einsammeln
+    # ----------------------------------------------------------
+    dataloader, _ = get_loaders(
+        "wikitext2",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,          # wichtig: identische Länge
+        tokenizer=tokenizer,
+    )
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.model.layers
 
+    # korrekte GPU für die Embeddings (wichtig bei 30B/65B-Sharding)
     if "model.embed_tokens" in model.hf_device_map:
         dev = model.hf_device_map["model.embed_tokens"]
 
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
-    )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    # etwas kürzeres Kalibrier-Fenster zur Beschleunigung (wie Wanda)
+    calib_len = 2048
+    with torch.no_grad():
+        inps, outs, replay_kw = prepare_calibration_input(
+            model, dataloader, dev, calib_len
+        )
 
+    # ausgepackte Keyword-Argumente (können None sein)
+    attn_mask = replay_kw.get("attention_mask")
+    pos_ids   = replay_kw.get("position_ids")
+    pos_emb   = replay_kw.get("position_embeddings")   # nur bei Qwen-3/DeepSeek
 
-    class Catcher(nn.Module):
-        """
-        A proxy that (1) grabs the pre-block activations for Wanda / SparseGPT
-        and (2) still looks *exactly* like the original layer to the outside
-        world – all attributes and methods are transparently delegated.
-        """
-        def __init__(self, module, store):
-            super().__init__()
-            self._orig  = module      # the real decoder layer
-            self._store = store       # dict with inps / masks / counters
+    layers = model.model.layers
 
-        # ------------------------- forward hook -------------------------
-        def forward(self, hidden_states, **kwargs):
-            """Save activations then raise to break the forward pass."""
-            self._store['inps'][self._store['i']] = hidden_states
-            self._store['i'] += 1
-            self._store['attention_mask'] = kwargs.get('attention_mask')
-            self._store['position_ids']   = kwargs.get('position_ids')
-            raise ValueError              # caught by prepare_calibration_input
-
-        # ----------------- transparent attribute delegation -------------
-        def __getattr__(self, name):
-            # keep local internals safe
-            if name in {'_orig', '_store'}:
-                return super().__getattr__(name)
-            # anything else → fall back to the real layer
-            return getattr(self._orig, name)
-        
-    layers[0] = Catcher(layers[0])
-    for batch in dataloader:
-        try:
-            model(batch[0].to(dev))
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-    torch.cuda.empty_cache()
-
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
-
-    print('Ready.')
-
-    for i in range(len(layers)):
-        layer = layers[i]
+    # ----------------------------------------------------------
+    # 2) Schicht für Schicht: Statistiken sammeln → prunen
+    # ----------------------------------------------------------
+    for i, layer in enumerate(layers):
+        # ggf. auf das GPU-Shard dieser Schicht umziehen
         if f"model.layers.{i}" in model.hf_device_map:
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            print(f"layer {i} device {dev}")
-            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+            dev_layer = model.hf_device_map[f"model.layers.{i}"]
+            inps = inps.to(dev_layer)
+            outs = outs.to(dev_layer)
+            if attn_mask is not None:
+                attn_mask = attn_mask.to(dev_layer)
+            if pos_ids is not None:
+                pos_ids = pos_ids.to(dev_layer)
+            if pos_emb is not None:
+                pos_emb = tuple(p.to(dev_layer) for p in pos_emb)
 
         subset = find_layers(layer)
+        gpts   = {n: SparseGPT(m) for n, m in subset.items()}
 
-        gpts = {}
-        for name in subset:
-            gpts[name] = SparseGPT(subset[name])
-
+        # ---------------- Aktivitäten sammeln -----------------
         def add_batch(name):
-            def tmp(_, inp, out):
+            def _hook(_, inp, out):
                 gpts[name].add_batch(inp[0].data, out.data)
-            return tmp
+            return _hook
 
-        handles = []
-        for name in gpts:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
+        handles = [
+            m.register_forward_hook(add_batch(n)) for n, m in subset.items()
+        ]
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            sig = inspect.signature(layer.forward)
+            call_kwargs = {}
+            if attn_mask is not None:
+                call_kwargs["attention_mask"] = attn_mask
+            if pos_ids is not None:
+                call_kwargs["position_ids"] = pos_ids
+            # nur mitsenden, wenn das Layer position_embeddings erwartet
+            if pos_emb is not None and "position_embeddings" in sig.parameters:
+                call_kwargs["position_embeddings"] = pos_emb
+                
+            outs[j] = layer(inps[j].unsqueeze(0), **call_kwargs)[0]
+
         for h in handles:
             h.remove()
 
-        for name in gpts:
-            print(i, name)
-            print('Pruning ...')
+        # ----------------------- Pruning -----------------------
+        for name, gpt in gpts.items():
+            print(f"Layer {i} – {name}: pruning …")
+            gpt.fasterprune(
+                args.sparsity_ratio,
+                prune_n=prune_n,
+                prune_m=prune_m,
+                percdamp=0.01,
+                blocksize=128,
+            )
+            gpt.free()
 
-            gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
-            gpts[name].free()
-
+        # ------------- Outputs neu berechnen -------------------
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            sig = inspect.signature(layer.forward)
+            call_kwargs = {}
+            if attn_mask is not None:
+                call_kwargs["attention_mask"] = attn_mask
+            if pos_ids is not None:
+                call_kwargs["position_ids"] = pos_ids
+            # nur mitsenden, wenn das Layer position_embeddings erwartet
+            if pos_emb is not None and "position_embeddings" in sig.parameters:
+                call_kwargs["position_embeddings"] = pos_emb
+                
+            outs[j] = layer(inps[j].unsqueeze(0), **call_kwargs)[0]
 
-        layers[i] = layer 
         torch.cuda.empty_cache()
+        inps, outs = outs, inps  # Buffer tauschen
 
-        inps, outs = outs, inps
-
+    # ----------------------------------------------------------
+    # 3) Aufräumen
+    # ----------------------------------------------------------
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
+    print("SparseGPT pruning finished.")
 
 
 
