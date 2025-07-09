@@ -16,6 +16,7 @@ print('# of gpus: ', torch.cuda.device_count())
 def get_llm(model_name, cache_dir="llm_weights"):
     model = AutoModelForCausalLM.from_pretrained(
         model_name, 
+        trust_remote_code=True,
         torch_dtype=torch.float16, 
         cache_dir=cache_dir, 
         low_cpu_mem_usage=True, 
@@ -80,8 +81,7 @@ def main():
     print(f"sparsity sanity check {sparsity_ratio:.4f}")
     print("*"*30)
     ################################################################
-    ppl_test = eval_ppl(args, model, tokenizer, device)
-    print(f"wikitext perplexity {ppl_test}")
+
 
     if not os.path.exists(args.save):
         os.makedirs(args.save)
@@ -90,6 +90,9 @@ def main():
         print("method\tactual_sparsity\tppl_test", file=f, flush=True)
         print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
 
+    ppl_test = eval_ppl(args, model, tokenizer, device)
+    print(f"wikitext perplexity {ppl_test}")
+    
     if args.eval_zero_shot:
         accelerate=False
         if "30b" in args.model or "65b" in args.model or "70b" in args.model:
