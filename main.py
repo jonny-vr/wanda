@@ -83,15 +83,36 @@ def main():
     ################################################################
 
 
+    #    auch wenn PPL später crasht)
+    # 1) Log-Verzeichnis & Header anlegen (damit das File da ist, 
     if not os.path.exists(args.save):
         os.makedirs(args.save)
     save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
     with open(save_filepath, "w") as f:
         print("method\tactual_sparsity\tppl_test", file=f, flush=True)
-        print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
 
-    ppl_test = eval_ppl(args, model, tokenizer, device)
-    print(f"wikitext perplexity {ppl_test}")
+    # 2) Modell speichern, bevor wir eval_ppl aufrufen
+    if args.save_model:
+        model.save_pretrained(args.save_model)
+        tokenizer.save_pretrained(args.save_model)
+        print(f"Model saved to {args.save_model}")
+
+    # 3) Perplexity berechnen (kann jetzt nicht mehr verhindern, 
+    #    dass Modell und Header schon da sind)
+    ppl_test = None
+    try:
+        ppl_test = eval_ppl(args, model, tokenizer, device)
+        print(f"wikitext perplexity {ppl_test}")
+    except Exception as e:
+        print(f"[ERROR] Perplexity evaluation failed: {e}")
+        # optional: sys.exit(1) oder weiterfahren
+
+    # 4) Ergebnis in die Logdatei anhängen (falls vorhanden)
+    if ppl_test is not None:
+        with open(save_filepath, "a") as f:
+            print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
+
+
     
     if args.eval_zero_shot:
         accelerate=False
