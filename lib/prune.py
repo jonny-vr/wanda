@@ -205,12 +205,15 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"),
         handles = [m.register_forward_hook(add_batch(n)) for n, m in subset.items()]
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
-                    attention_mask=attn_mask,
-                    position_ids=pos_ids,
-                    position_embeddings=pos_emb,
-                )[0]
+                call_kwargs = {
+                    "attention_mask": attn_mask,
+                    "position_ids":   pos_ids,
+                }
+                # only include pos_emb if the layer actually accepts it
+                if pos_emb is not None and "position_embeddings" in layer.forward.__code__.co_varnames:
+                    call_kwargs["position_embeddings"] = pos_emb
+
+                outs[j] = layer(inps[j].unsqueeze(0), **call_kwargs)[0]
         for h in handles:
             h.remove()
 
@@ -236,12 +239,15 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"),
         # swap inps/outs for next layer
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
-                    attention_mask=attn_mask,
-                    position_ids=pos_ids,
-                    position_embeddings=pos_emb,
-                )[0]
+                call_kwargs = {
+                    "attention_mask": attn_mask,
+                    "position_ids":   pos_ids,
+                }
+                # only include pos_emb if the layer actually accepts it
+                if pos_emb is not None and "position_embeddings" in layer.forward.__code__.co_varnames:
+                    call_kwargs["position_embeddings"] = pos_emb
+
+                outs[j] = layer(inps[j].unsqueeze(0), **call_kwargs)[0]
         inps, outs = outs, inps            # flip buffers
 
     model.config.use_cache = use_cache
