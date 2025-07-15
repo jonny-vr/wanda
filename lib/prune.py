@@ -6,6 +6,8 @@ import torch.nn as nn
 from .sparsegpt import SparseGPT 
 from .layerwrapper import WrappedGPT
 from .data import get_loaders 
+import torch.nn.utils.prune as prune
+import inspect
 
 from .ablate import AblateGPT 
 
@@ -153,41 +155,58 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
 
             W[W_mask] = 0
 
-def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"),
-                prune_n=0, prune_m=0):
+
+
+# -------------------------------------------------------------------------
+# Wanda-Pruning mit persistenter Maske
+# -------------------------------------------------------------------------
+@torch.no_grad()
+def prune_wanda(
+    args,
+    model,
+    tokenizer,
+    device=torch.device("cuda:0"),
+    prune_n: int = 0,
+    prune_m: int = 0,
+):
+    """
+    Wanda-Pruning, aber die Null-Gewichte werden per weight_mask dauerhaft
+    fixiert, so dass sie sich bei weiterem Training nicht „wiederbeleben“.
+    """
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
-    calib_len = 2048                         # shorter window for fast calibration
-    print("loading calibration data")
+    # 0) Kalibrier-Daten vorbereiten (wie im Original)
+    calib_len = 2048
+    print("loading calibration data …")
     dataloader, _ = get_loaders(
         "wikitext2",
         nsamples=args.nsamples,
         seed=args.seed,
-        seqlen=model.seqlen,                   # IMPORTANT: use same length everywhere
+        seqlen=model.seqlen,
         tokenizer=tokenizer,
     )
-
     with torch.no_grad():
         inps, outs, replay_kw = prepare_calibration_input(
             model, dataloader, device, calib_len
         )
     print("dataset loading complete")
 
-    # unpack the captured kwargs once
     attn_mask = replay_kw.get("attention_mask")
     pos_ids   = replay_kw.get("position_ids")
-    pos_emb   = replay_kw.get("position_embeddings")   # Qwen-3 only
+    pos_emb   = replay_kw.get("position_embeddings")   # Qwen-3 / DeepSeek
 
     layers = model.model.layers
+    # ------------------------------------------------------------------
+    # 1) Schicht für Schicht: Statistiken sammeln → Maske ableiten → anwenden
+    # ------------------------------------------------------------------
     for i, layer in enumerate(layers):
         subset = find_layers(layer)
 
-        # move tensors to the GPU that holds this layer (for sharded 30B/65B)
+        # ggf. auf das richtige GPU-Shard umziehen (bei mp-sharding)
         if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
-            inps = inps.to(dev)
-            outs = outs.to(dev)
+            inps, outs = inps.to(dev), outs.to(dev)
             if attn_mask is not None:
                 attn_mask = attn_mask.to(dev)
             if pos_ids is not None:
@@ -195,68 +214,69 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"),
             if pos_emb is not None:
                 pos_emb = tuple(p.to(dev) for p in pos_emb)
 
-        # ------------- gather activation statistics -----------------
-        wrapped_layers = {n: WrappedGPT(m) for n, m in subset.items()}
+        # ---------- Aktivitäts-Statistik sammeln ----------
+        wrapped = {n: WrappedGPT(m) for n, m in subset.items()}
 
         def add_batch(name):
             def _hook(_, inp, out):
-                wrapped_layers[name].add_batch(inp[0].data, out.data)
+                wrapped[name].add_batch(inp[0].data, out.data)
             return _hook
 
-        handles = [m.register_forward_hook(add_batch(n)) for n, m in subset.items()]
+        hooks = [m.register_forward_hook(add_batch(n)) for n, m in subset.items()]
         for j in range(args.nsamples):
-            with torch.no_grad():
-                sig = inspect.signature(layer.forward)
-                call_kwargs = {}
-                if attn_mask is not None:
-                    call_kwargs["attention_mask"] = attn_mask
-                if pos_ids is not None:
-                    call_kwargs["position_ids"] = pos_ids
-                # nur mitsenden, wenn das Layer position_embeddings erwartet
-                if pos_emb is not None and "position_embeddings" in sig.parameters:
-                    call_kwargs["position_embeddings"] = pos_emb
-                    
-                outs[j] = layer(inps[j].unsqueeze(0), **call_kwargs)[0]
-        for h in handles:
-            h.remove()
+            sig = inspect.signature(layer.forward)
+            kw  = {}
+            if attn_mask is not None: kw["attention_mask"] = attn_mask
+            if pos_ids   is not None: kw["position_ids"]   = pos_ids
+            if pos_emb   is not None and "position_embeddings" in sig.parameters:
+                kw["position_embeddings"] = pos_emb
+            outs[j] = layer(inps[j].unsqueeze(0), **kw)[0]
+        for h in hooks: h.remove()
 
-        # ----------------------- pruning ----------------------------
+        # -------------------- Wanda-Masken ableiten --------------------
         for name, mod in subset.items():
-            print(f"pruning layer {i} name {name}")
+            print(f"Layer {i} – {name}: compute Wanda mask")
             W = mod.weight.data
-            W_metric = torch.abs(W) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
+            metric = torch.abs(W) * torch.sqrt(
+                wrapped[name].scaler_row.reshape(1, -1)
+            )
 
-            W_mask = torch.zeros_like(W, dtype=torch.bool)
-            if prune_n:                    # structured N:M
-                for col in range(0, W_metric.shape[1], prune_m):
-                    block = W_metric[:, col:col + prune_m]
-                    topk  = torch.topk(block, prune_n, dim=1, largest=False).indices
-                    W_mask.scatter_(1, col + topk, True)
-            else:                          # unstructured
-                k = int(W_metric.numel() * args.sparsity_ratio)
-                thresh = torch.topk(W_metric.view(-1), k, largest=False).values.max()
-                W_mask = W_metric <= thresh
+            if prune_n:                                   # strukturiert N:M
+                mask_bool = torch.zeros_like(W, dtype=torch.bool)
+                for col in range(0, metric.shape[1], prune_m):
+                    blk   = metric[:, col:col + prune_m]
+                    topk  = torch.topk(blk, prune_n, dim=1, largest=False).indices
+                    mask_bool.scatter_(1, col + topk, True)
+            else:                                         # unstrukturiert
+                k = int(metric.numel() * args.sparsity_ratio)
+                thresh = torch.topk(metric.view(-1), k, largest=False).values.max()
+                mask_bool = metric <= thresh              # True == prune
 
-            W[W_mask] = 0.0
+            # -----------------------------------------------------------
+            # Persistente Maske via torch.prune
+            # -----------------------------------------------------------
+            # torch-Mask soll 1 = KEEP, 0 = PRUNE ⇒ invertieren
+            torch_mask = (~mask_bool).to(W.device)
+            prune.custom_from_mask(mod, name="weight", mask=torch_mask)
+            # weight = weight_orig * weight_mask  (forward-zeit)
 
-        # swap inps/outs for next layer
+        # ----------- Puffer tauschen (für nächste Schicht) --------------
         for j in range(args.nsamples):
-            with torch.no_grad():
-                sig = inspect.signature(layer.forward)
-                call_kwargs = {}
-                if attn_mask is not None:
-                    call_kwargs["attention_mask"] = attn_mask
-                if pos_ids is not None:
-                    call_kwargs["position_ids"] = pos_ids
-                # nur mitsenden, wenn das Layer position_embeddings erwartet
-                if pos_emb is not None and "position_embeddings" in sig.parameters:
-                    call_kwargs["position_embeddings"] = pos_emb
-                    
-                outs[j] = layer(inps[j].unsqueeze(0), **call_kwargs)[0]
-        inps, outs = outs, inps            # flip buffers
+            sig = inspect.signature(layer.forward)
+            kw  = {}
+            if attn_mask is not None: kw["attention_mask"] = attn_mask
+            if pos_ids   is not None: kw["position_ids"]   = pos_ids
+            if pos_emb   is not None and "position_embeddings" in sig.parameters:
+                kw["position_embeddings"] = pos_emb
+            outs[j] = layer(inps[j].unsqueeze(0), **kw)[0]
+        inps, outs = outs, inps   # flip buffers
 
+    # ------------------------------------------------------------------
+    # 2) Aufräumen
+    # ------------------------------------------------------------------
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
+    print("Wanda pruning finished – masks are now persistent.")
 
 
 @torch.no_grad()
