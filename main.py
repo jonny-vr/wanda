@@ -4,6 +4,8 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
+import time
+import wandb
 
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 from lib.eval import eval_ppl, eval_zero_shot
@@ -39,9 +41,18 @@ def main():
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
+    parser.add_argument("--wandb_run_name", default=None)
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
+    
+    wandb_run = wandb.init(
+        project="llama-distillation",
+        name=args.wandb_run_name or "pruning_wanda",
+        entity="jonathan-von-rad",
+        config=vars(args)
+        # alle CLI-Parameter als Konfig
+    )
 
     # Setting seeds for reproducibility
     np.random.seed(args.seed)
@@ -64,6 +75,8 @@ def main():
         device = model.hf_device_map["lm_head"]
     print("use device ", device)
 
+    start_time = time.perf_counter()
+    torch.cuda.reset_peak_memory_stats(device)
     if args.sparsity_ratio != 0:
         print("pruning starts")
         if args.prune_method == "wanda":
@@ -75,6 +88,14 @@ def main():
         elif "ablate" in args.prune_method:
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
 
+    pruning_time = time.perf_counter() - start_time
+    max_mem_bytes = torch.cuda.max_memory_allocated(device)
+    print(f"pruning took {pruning_time:.2f} seconds")
+    wandb.log({
+        "pruning_time_sec": pruning_time,
+        "gpu_max_mem_GB": max_mem_bytes / 1024**3,
+    })
+    wandb.finish()
     ################################################################
     print("*"*30)
     sparsity_ratio = check_sparsity(model)
