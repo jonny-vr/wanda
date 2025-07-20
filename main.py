@@ -114,9 +114,24 @@ def main():
 
     # 2) Modell speichern, bevor wir eval_ppl aufrufen
     if args.save_model:
-        model.save_pretrained(args.save_model)
-        tokenizer.save_pretrained(args.save_model)
-        print(f"Model saved to {args.save_model}")
+        # Zwei Versionen speichern: mit und ohne Masken
+        
+        # Version 1: Mit Masken für Distillation (Standardpfad)
+        # Manuell speichern, damit die Masken erhalten bleibe
+        
+        # Version 2: Ohne Masken für normale Nutzung
+        
+        save_model_clean = args.save_model
+        
+        # Masken entfernen (macht weight_orig * weight_mask zu weight)
+        from torch.nn.utils import prune
+        for name, module in model.named_modules():
+            if hasattr(module, 'weight_mask'):
+                prune.remove(module, 'weight')
+        
+        model.save_pretrained(save_model_clean)
+        tokenizer.save_pretrained(save_model_clean)
+        print(f"Model without masks saved to {save_model_clean}")
 
     # 3) Perplexity berechnen (kann jetzt nicht mehr verhindern, 
     #    dass Modell und Header schon da sind)
@@ -147,9 +162,8 @@ def main():
         print("zero_shot evaluation results")
         print(results)
 
-    if args.save_model:
-        model.save_pretrained(args.save_model)
-        tokenizer.save_pretrained(args.save_model)
+
+        
 
 if __name__ == '__main__':
     main()
