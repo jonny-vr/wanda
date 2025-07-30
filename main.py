@@ -42,6 +42,9 @@ def main():
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
     parser.add_argument("--wandb_run_name", default=None)
+    parser.add_argument('--calib_dataset', type=str, default='wikitext2', 
+                    choices=['wikitext2', 'c4', 'gsm8k', 'arc', 'commonsenseqa', 'mixed_reasoning'],
+                    help='Dataset to use for calibration')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()

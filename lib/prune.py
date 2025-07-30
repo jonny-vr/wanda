@@ -177,10 +177,11 @@ def prune_wanda(
     model.config.use_cache = False
 
     # 0) Kalibrier-Daten vorbereiten (wie im Original)
-    calib_len = 2048
+    calib_len = 4096
     print("loading calibration data …")
+    print(f"loading calibration data from {args.calib_dataset}...")
     dataloader, _ = get_loaders(
-        "wikitext2",
+        args.calib_dataset,  # Changed from hardcoded "wikitext2"
         nsamples=args.nsamples,
         seed=args.seed,
         seqlen=model.seqlen,
@@ -301,11 +302,12 @@ def prune_sparsegpt(
     # ----------------------------------------------------------
     # 1) Kalibrierdaten laden und Aktivierungen einsammeln
     # ----------------------------------------------------------
+    print(f"loading calibration data from {args.calib_dataset}...")
     dataloader, _ = get_loaders(
-        "wikitext2",
+        args.calib_dataset,  # Changed from hardcoded "wikitext2"
         nsamples=args.nsamples,
         seed=args.seed,
-        seqlen=model.seqlen,          # wichtig: identische Länge
+        seqlen=model.seqlen,
         tokenizer=tokenizer,
     )
 
@@ -317,7 +319,7 @@ def prune_sparsegpt(
         dev = model.hf_device_map["model.embed_tokens"]
 
     # etwas kürzeres Kalibrier-Fenster zur Beschleunigung (wie Wanda)
-    calib_len = 2048
+    calib_len = 4096
     with torch.no_grad():
         inps, outs, replay_kw = prepare_calibration_input(
             model, dataloader, dev, calib_len
